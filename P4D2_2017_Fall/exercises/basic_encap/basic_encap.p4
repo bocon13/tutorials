@@ -2,8 +2,8 @@
 #include <core.p4>
 #include <v1model.p4>
 
+const bit<16> TUNNEL_MAGIC = 0xABCD;
 const bit<16> TYPE_IPV4 = 0x800;
-const bit<8>  PROTO_MYENCAP = 253;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -13,7 +13,10 @@ typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
 
-direct_counter(CounterType.packets_and_bytes) validCount;
+header myTunnel_t {
+    bit<16> magic;
+    bit<48> id;
+}
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -36,18 +39,14 @@ header ipv4_t {
     ip4Addr_t dstAddr;
 }
 
-header myEncap_t {
-    bit<8> valid;
-}
-
 struct metadata {
     /* empty */
 }
 
 struct headers {
+    myTunnel_t   myTunnel;
     ethernet_t   ethernet;
     ipv4_t       ipv4;
-    myEncap_t    myEncap;
 }
 
 /*************************************************************************
@@ -60,6 +59,14 @@ parser MyParser(packet_in packet,
                 inout standard_metadata_t standard_metadata) {
 
     state start {
+        transition select(packet.lookahead<bit<16>>()) {
+            TUNNEL_MAGIC: parse_myTunnel;
+            default: parse_ethernet;
+        }
+    }
+
+    state parse_myTunnel {
+        packet.extract(hdr.myTunnel);
         transition parse_ethernet;
     }
 
@@ -73,17 +80,8 @@ parser MyParser(packet_in packet,
 
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
-        transition select(hdr.ipv4.protocol) {
-            PROTO_MYENCAP: parse_myEncap;
-            default: accept;
-        }
-    }
-
-    state parse_myEncap {
-        packet.extract(hdr.myEncap);
         transition accept;
     }
-
 }
 
 /*************************************************************************
@@ -105,12 +103,11 @@ control MyIngress(inout headers hdr,
     action drop() {
         mark_to_drop();
     }
-    
-    action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
-        standard_metadata.egress_spec = port;
-        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
-        hdr.ethernet.dstAddr = dstAddr;
-        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+
+    action tunnel_ingress(bit<48> id) {
+        hdr.myTunnel.setValid();
+        hdr.myTunnel.magic = TUNNEL_MAGIC;
+        hdr.myTunnel.id = id;
     }
     
     table ipv4_lpm {
@@ -118,36 +115,46 @@ control MyIngress(inout headers hdr,
             hdr.ipv4.dstAddr: lpm;
         }
         actions = {
-            ipv4_forward;
+            tunnel_ingress;
             drop;
-            NoAction;
         }
         size = 1024;
-        default_action = NoAction();
+        const default_action = drop();
     }
     
-    action count() {
-        validCount.count();
+    //TODO(BOC) should this look more like a L2 or L3 forwarding element?
+    action tunnel_forward(egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+        //TODO hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
-    table myEncap_check {
+    action tunnel_egress(/*TODO(BOC) macAddr_t dstAddr,*/ egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+        //TODO(BOC) hdr.ethernet.dstAddr = dstAddr;
+        hdr.myTunnel.setInvalid();
+        //TODO(BOC) hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+    }
+
+    direct_counter(CounterType.packets_and_bytes) tunnelCount;
+
+    table myTunnelTable {
         key = {
-            hdr.myEncap.valid: exact;
+            hdr.myTunnel.id: exact;
         }
         actions = {
+            tunnel_forward;
+            tunnel_egress;
             drop;
-            count;
         }
-        counters = validCount;
+        counters = tunnelCount;
+        const default_action = drop();
     }
 
     apply {
-        if (hdr.ipv4.isValid()) {
+        if (!hdr.myTunnel.isValid()) {
             ipv4_lpm.apply();
         }
-        if (hdr.myEncap.isValid()) {
-            myEncap_check.apply();
-        }
+        myTunnelTable.apply();
     }
 }
 
@@ -166,23 +173,7 @@ control MyEgress(inout headers hdr,
 *************************************************************************/
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
-     apply {
-	update_checksum(
-	    hdr.ipv4.isValid(),
-            { hdr.ipv4.version,
-	      hdr.ipv4.ihl,
-              hdr.ipv4.diffserv,
-              hdr.ipv4.totalLen,
-              hdr.ipv4.identification,
-              hdr.ipv4.flags,
-              hdr.ipv4.fragOffset,
-              hdr.ipv4.ttl,
-              hdr.ipv4.protocol,
-              hdr.ipv4.srcAddr,
-              hdr.ipv4.dstAddr },
-            hdr.ipv4.hdrChecksum,
-            HashAlgorithm.csum16);
-    }
+     apply {  }
 }
 
 /*************************************************************************
@@ -191,9 +182,9 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
+        packet.emit(hdr.myTunnel);
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
-        packet.emit(hdr.myEncap);
     }
 }
 
